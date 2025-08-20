@@ -1,70 +1,91 @@
 import tensorflow as tf
-from tensorflow.keras import layers
 
-class BiNLOP(tf.keras.layers.Layer):
+@tf.custom_gradient
+def binlop_op(x, gamma, k):
+    # Forward operation
+    y = gamma * x + (1.0 - gamma) * tf.clip_by_value(x, -k, k)
+
+    def grad(dy):
+        # Gradient backward similar to PyTorch implementation
+        M = tf.cast(tf.abs(y) > k, dy.dtype)
+        signy = tf.sign(y)
+
+        dx = dy * (1.0 - (1.0 - gamma) * M)
+        clamp_y = tf.clip_by_value(y, -k, k)
+        dgamma = dy * ((y - clamp_y) / (gamma + 1e-12)) * M
+        dk = dy * (1.0 - gamma) * signy * M
+
+        # Sum gradients over broadcasted dimensions for gamma and k
+        # Reduce dims if needed according to the shapes of gamma and k
+        while dgamma.shape.ndims > gamma.shape.ndims:
+            dgamma = tf.reduce_sum(dgamma, axis=0)
+            dk = tf.reduce_sum(dk, axis=0)
+
+        # No explicit sum across parameter dims if not needed, relying on broadcasting
+
+        return dx, dgamma, dk
+
+    return y, grad
+
+
+class BiNLOP2(tf.Module):
     """
-    BiNLOP-1: Linear-Tail Hinge
-    phi(x) = x - (1 - gamma) * sign(x) * relu(|x| - k)
-    Guarantees: odd, monotone, bi-Lipschitz with phi' in {1, gamma}, invertible.
+    BiNLOP-2: φ(x) = γ x + (1 − γ) clamp(x, −k, k)
+    Odd, monotone, bi-Lipschitz, invertible; dtype-preserving; memoryless backward.
     """
-
-    def __init__(self, gamma_min=0.6, gamma_init=0.8, k_init=2.0,
-                 per_channel=False, num_channels=None, **kwargs):
-        super(BiNLOP, self).__init__(**kwargs)
-
+    def __init__(self, gamma_min=0.6, gamma_init=0.85, k_init=2.0, per_channel=False, num_channels=None, name=None):
+        super().__init__(name=name)
         assert 0.0 < gamma_min < 1.0 and gamma_min < gamma_init < 1.0
-        self.gamma_min = float(gamma_min)
+        self.gamma_min = gamma_min
         self.per_channel = per_channel
-        self.num_channels = num_channels
 
-        # Convert gamma_init to probability form (same as PyTorch version)
-        p = (gamma_init - gamma_min) / (1.0 - gamma_min)
-        p = float(max(min(p, 1 - 1e-6), 1e-6))
-        g_hat_init = tf.math.log(p) - tf.math.log(1.0 - p)  # logit
-        s_hat_init = tf.math.log(k_init)
+        def clip_p(p):
+            return max(min(p, 1 - 1e-6), 1e-6)
+
+        p = (gamma_init - gamma_min) / (1 - gamma_min)
+        p = clip_p(p)
 
         if per_channel:
-            assert num_channels is not None and num_channels > 0
-            g_shape = (num_channels,)
-            s_shape = (num_channels,)
-        else:
-            g_shape = ()
-            s_shape = ()
+            assert num_channels and num_channels > 0
+            init_g = tf.fill([num_channels], tf.math.log(p / (1 - p)))  # inverse sigmoid / logit
+            init_s = tf.fill([num_channels], tf.math.log(k_init))
 
-        self.g_hat = tf.Variable(initial_value=tf.fill(g_shape, g_hat_init),
-                                 trainable=True, dtype=tf.float32, name="g_hat")
-        self.s_hat = tf.Variable(initial_value=tf.fill(s_shape, s_hat_init),
-                                 trainable=True, dtype=tf.float32, name="s_hat")
+            self.g_hat = tf.Variable(init_g, dtype=tf.float32, trainable=True)
+            self.s_hat = tf.Variable(init_s, dtype=tf.float32, trainable=True)
+        else:
+            self.g_hat = tf.Variable(tf.math.log(p / (1 - p)), dtype=tf.float32, trainable=True)
+            self.s_hat = tf.Variable(tf.math.log(k_init), dtype=tf.float32, trainable=True)
 
     def _params(self, x):
         gamma = self.gamma_min + (1.0 - self.gamma_min) * tf.sigmoid(self.g_hat)
         k = tf.exp(self.s_hat)
 
         if self.per_channel:
-            if len(x.shape) == 4:  # NHWC format in TF (not NCHW!)
-                gamma = tf.reshape(gamma, (1, 1, 1, -1))
-                k = tf.reshape(k, (1, 1, 1, -1))
-            elif len(x.shape) == 3:  # NLC
-                gamma = tf.reshape(gamma, (1, 1, -1))
-                k = tf.reshape(k, (1, 1, -1))
+            # Reshape gamma and k to be broadcastable with input x
+            if len(x.shape) == 4:   # NCHW or NHWC? TensorFlow default is NHWC
+                # Assuming NHWC: shape = (batch, height, width, channels)
+                gamma = tf.reshape(gamma, [1, 1, 1, -1])
+                k = tf.reshape(k, [1, 1, 1, -1])
+            elif len(x.shape) == 3: # NLC or NCL shape is less common in TF, guessing NLC (batch, length, channels)
+                gamma = tf.reshape(gamma, [1, 1, -1])
+                k = tf.reshape(k, [1, 1, -1])
+        return tf.cast(gamma, x.dtype), tf.cast(k, x.dtype)
 
-        return gamma, k
+    def __call__(self, x):
+        gamma, k = self._params(x)
+        return binlop_op(x, gamma, k)
 
-    def call(self, x):
-        x32 = tf.cast(x, tf.float32)  # internal computations in float32
-        gamma, k = self._params(x32)
-        s = tf.abs(x32)
-        t = tf.nn.relu(s - k)
-        y = x32 - (1.0 - gamma) * tf.sign(x32) * t
-        return tf.cast(y, x.dtype)
-
+    @tf.function
     def invert(self, y):
-        y32 = tf.cast(y, tf.float32)
-        gamma, k = self._params(y32)
-        s = tf.abs(y32)
+        gamma, k = self._params(y)
+        s = tf.abs(y)
         core = s <= k
         inv_gamma = 1.0 / gamma
-        x_core = y32
-        x_tail = tf.sign(y32) * (k + (s - k) * inv_gamma)
-        x = tf.where(core, x_core, x_tail)
-        return tf.cast(x, y.dtype)
+        x = tf.where(core, y, tf.sign(y) * (k + (s - k) * inv_gamma))
+        return x
+
+    @tf.function
+    def logdet(self, x):
+        gamma, k = self._params(x)
+        mask = tf.cast(tf.abs(x) > k, x.dtype)
+        return tf.reduce_sum(mask * tf.math.log(gamma))
