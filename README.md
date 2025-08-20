@@ -4,5 +4,5 @@ BiNLOP (Bipolar Nonlinear Operator) is a novel activation function for deep lear
 
 BiNLOP is denoted as:
 
-y = x - (1-γ) * sign(x) * relu(|x|-k)
+c = gx+(1-g)*max(-k,min(k,x)
 Where γ is a trainable parameter, as with k.
